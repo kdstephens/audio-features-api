@@ -1,5 +1,5 @@
 from typing import Optional, List, Any, Dict
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 class AnalyzeQuery(BaseModel):
     spotify: Optional[str] = None           # URL or 22-char ID
@@ -32,6 +32,4 @@ class AudioFeaturesResponse(BaseModel):
     analysis_notes: Optional[List[str]] = None
 
     # allow passthrough if needed
-    class Config:
-        arbitrary_types_allowed = True
-        extra = "allow"
+    model_config = ConfigDict(arbitrary_types_allowed=True, extra="allow")
