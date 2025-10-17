@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import io
+import io, os, tempfile
 from typing import Dict, Any, Optional, List
 
 import numpy as np
@@ -22,19 +22,48 @@ except Exception:
 
 # --------- Audio I/O --------- #
 
+def _guess_ext_from_magic(b: bytes) -> str:
+    head = b[:16]
+    if head.startswith(b"ID3") or head[:2] == b"\xff\xfb" or head[:2] == b"\xff\xf3" or head[:2] == b"\xff\xf2":
+        return ".mp3"
+    if b"ftyp" in head:
+        # mp4/m4a family (AAC in MP4)
+        return ".m4a"
+    return ".mp3"  # safe default for Deezer; Apple tends to be m4a
+
 def load_audio_from_bytes(b: bytes, target_sr: int = TARGET_SR) -> tuple[np.ndarray, int]:
+    """
+    Robust loader:
+      1) try soundfile (WAV/OGG/FLAC/etc.)
+      2) on failure, write bytes to a temp file with guessed extension
+         so librosa can use audioread+ffmpeg to decode MP3/AAC (m4a)
+    """
     bio = io.BytesIO(b)
+    # 1) Try libsndfile via soundfile
     try:
         y, sr = sf.read(bio, dtype="float32", always_2d=False)
         if y.ndim > 1:
             y = np.mean(y, axis=1)
     except Exception:
-        bio.seek(0)
-        y, sr = librosa.load(bio, sr=None, mono=True)
+        # 2) Fallback: use a temp file so librosa can trigger audioread/ffmpeg
+        ext = _guess_ext_from_magic(b)
+        tmp = tempfile.NamedTemporaryFile(suffix=ext, delete=False)
+        try:
+            tmp.write(b)
+            tmp.flush()
+            tmp.close()
+            y, sr = librosa.load(tmp.name, sr=None, mono=True)  # this path uses audioread if needed
+        finally:
+            try:
+                os.unlink(tmp.name)
+            except Exception:
+                pass
+
     if sr != target_sr:
         y = librosa.resample(y, orig_sr=sr, target_sr=target_sr)
         sr = target_sr
     return y, sr
+
 
 # --------- Feature extractors --------- #
 
