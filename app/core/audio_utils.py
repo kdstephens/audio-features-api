@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import io, os, tempfile
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
 
 import numpy as np
 import soundfile as sf
@@ -9,18 +9,14 @@ import librosa
 import pyloudnorm as pyln
 from fastapi import UploadFile, HTTPException
 
-from app.core.config import TARGET_SR, CAMELOT_TABLE
+from app.core.config import TARGET_SR, CAMELOT_TABLE, KEY_TO_NUMBER
 from app.core.models import AnalyzeQuery
 from app.core import resolvers
 
-# --------- Optional Essentia (guarded) --------- #
-try:
-    from essentia.standard import KeyExtractor
-    _ESSENTIA = True
-except Exception:
-    _ESSENTIA = False
+# Krumhansl–Schmuckler tonal profiles
+_KRUMHANSL_MAJOR = np.array([6.35,2.23,3.48,2.33,4.38,4.09,2.52,5.19,2.39,3.66,2.29,2.88], dtype=float)
+_KRUMHANSL_MINOR = np.array([6.33,2.68,3.52,5.38,2.60,3.53,2.54,4.75,3.98,2.69,3.34,3.17], dtype=float)
 
-# --------- Audio I/O --------- #
 
 def _guess_ext_from_magic(b: bytes) -> str:
     head = b[:16]
@@ -85,15 +81,39 @@ def compute_energy(y: np.ndarray) -> float:
     # scale -60..0 dB → 0..1
     return float(np.clip((db + 60.0) / 60.0, 0.0, 1.0))
 
-def extract_key_mode(y: np.ndarray, sr: int) -> tuple[Optional[str], Optional[str]]:
-    if not _ESSENTIA:
-        return None, None
+def estimate_key_mode_krumhansl(y: np.ndarray, sr: int) -> Tuple[Optional[int], Optional[str], Optional[str]]:
+    """
+    Estimate (key_name, mode_name) using chroma (CQT) and Krumhansl-Schmuckler profiles.
+    Returns e.g. ("C", "major") or (None, None) if inconclusive.
+    """
     try:
-        key, scale, strength = KeyExtractor()(y, sr)
-        mode = "major" if scale.lower().startswith("maj") else "minor"
-        return key, mode
+        # Chroma via CQT is robust to timbre; you can try chroma_stft as a fallback.
+        chroma = librosa.feature.chroma_cqt(y=y, sr=sr)
+        pc = chroma.mean(axis=1)  # 12-vector
+        if not np.any(pc):
+            return None, None
+        pc = pc / (pc.max() + 1e-9)
+
+        def best_rotation(profile: np.ndarray) -> Tuple[int, float]:
+            # correlate with all 12 rotations
+            scores = [float(np.dot(pc, np.roll(profile, k))) for k in range(12)]
+            k = int(np.argmax(scores))
+            return k, scores[k]
+
+        maj_k, maj_s = best_rotation(_KRUMHANSL_MAJOR)
+        min_k, min_s = best_rotation(_KRUMHANSL_MINOR)
+
+        if maj_s >= min_s:
+            key_num, mode = maj_k, "major"
+        else:
+            key_num, mode = min_k, "minor"
+
+        from app.core.config import NUMBER_TO_KEY_SHARP  # local import to avoid cycles
+        key_name = NUMBER_TO_KEY_SHARP[key_num]
+        return key_num, key_name, mode
+    
     except Exception:
-        return None, None
+        return None, None, None
 
 def to_camelot(key_name: Optional[str], mode_name: Optional[str]) -> Optional[str]:
     if not key_name or not mode_name:
@@ -109,23 +129,25 @@ def classify_with_models(y: np.ndarray, sr: int) -> Dict[str, float]:
 
 def to_spotify_like(payload: Dict[str, Any]) -> Dict[str, Any]:
     return {
+        # Spotify-like keys
         "acousticness": payload.get("acousticness"),
         "danceability": payload.get("danceability"),
         "duration_ms": payload.get("duration_ms"),
         "energy": payload.get("energy"),
-        "id": payload.get("id"),
         "instrumentalness": payload.get("instrumentalness"),
         "key": payload.get("key_number"),
         "liveness": payload.get("liveness"),
         "loudness": payload.get("loudness_db"),
         "mode": payload.get("mode_bit"),
         "speechiness": payload.get("speechiness"),
+        "spotify_id": payload.get("spotify_id"),
         "tempo": payload.get("tempo"),
         "time_signature": payload.get("time_signature"),
         "type": "audio_features",
         "valence": payload.get("valence"),
-        # extras
+        # Extras
         "key_name": payload.get("key_name"),
+        "mode_name": payload.get("mode_name"),     # <-- add this
         "camelot": payload.get("camelot"),
         "analysis_notes": payload.get("analysis_notes", []),
     }
@@ -169,21 +191,23 @@ async def analyze_audio_from_url(q: AnalyzeQuery) -> Dict[str, Any]:
     loudness_db = round(compute_loudness_lufs(y, sr), 3)
     energy = round(compute_energy(y), 3)
 
-    key_name, mode_name = extract_key_mode(y, sr)
+    # --- Key / Mode (Krumhansl–Schmuckler) ---
+    key_number, key_name, mode_name = estimate_key_mode_krumhansl(y, sr)
     camelot = to_camelot(key_name, mode_name)
 
     ml = classify_with_models(y, sr)  # danceability/valence/etc. (currently empty)
 
     payload = {
-        "id": spid or None,
+        "spotify_id": spid or None,
         "duration_ms": duration_ms,
         "tempo": tempo,
         "loudness_db": loudness_db,
         "energy": energy,
         "key_name": key_name,
         "camelot": camelot,
-        "key_number": None,                       # map key_name→number if desired
+        "key_number": key_number,                      
         "mode_bit": 1 if mode_name == "major" else (0 if mode_name == "minor" else None),
+        'mode_name': mode_name,
         "time_signature": None,                   # low confidence from 30s; leave None
         "analysis_notes": notes,
         # classifiers (optional; None if not wired)
@@ -194,6 +218,7 @@ async def analyze_audio_from_url(q: AnalyzeQuery) -> Dict[str, Any]:
         "speechiness": ml.get("speechiness"),
         "liveness": ml.get("liveness"),
     }
+
     return to_spotify_like(payload)
 
 async def analyze_audio_from_upload(file: UploadFile) -> Dict[str, Any]:
@@ -205,8 +230,10 @@ async def analyze_audio_from_upload(file: UploadFile) -> Dict[str, Any]:
     loudness_db = round(compute_loudness_lufs(y, sr), 3)
     energy = round(compute_energy(y), 3)
 
-    key_name, mode_name = extract_key_mode(y, sr)
+    # --- Key / Mode (Krumhansl–Schmuckler) ---
+    key_number, key_name, mode_name = estimate_key_mode_krumhansl(y, sr)
     camelot = to_camelot(key_name, mode_name)
+
     ml = classify_with_models(y, sr)
 
     payload = {
@@ -217,8 +244,9 @@ async def analyze_audio_from_upload(file: UploadFile) -> Dict[str, Any]:
         "energy": energy,
         "key_name": key_name,
         "camelot": camelot,
-        "key_number": None,
+        "key_number": key_number,
         "mode_bit": 1 if mode_name == "major" else (0 if mode_name == "minor" else None),
+        "mode_name": mode_name,
         "time_signature": None,
         "analysis_notes": ["Analyzed uploaded audio file."],
         "danceability": ml.get("danceability"),
@@ -228,4 +256,5 @@ async def analyze_audio_from_upload(file: UploadFile) -> Dict[str, Any]:
         "speechiness": ml.get("speechiness"),
         "liveness": ml.get("liveness"),
     }
+
     return to_spotify_like(payload)
